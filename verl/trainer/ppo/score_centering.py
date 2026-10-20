@@ -151,6 +151,37 @@ def topk_log_probs_from_logits(
     return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size)
 
 
+def sampled_and_topk_log_probs_from_logits(
+    logits: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    topk_token_ids: torch.Tensor,
+    chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score sampled tokens and sampler heads with one normalization and backward.
+
+    Args:
+        logits: Temperature-scaled trainer logits, shape (N, V).
+        sampled_token_ids: Already shifted, rank-local next-token labels, shape (N,).
+        topk_token_ids: Sampler head ids, shape (N, k).
+        chunk_size: Maximum rows in the FP32 vocabulary workspace.
+
+    Returns:
+        FP32 sampled log-probs (N,) and head log-probs (N, k). Both outputs share
+        the same autograd node, so backward combines their contributions before
+        computing the vocabulary gradient. A sampled token may also occur in the
+        head: scatter_add in the shared backward accumulates both contributions.
+
+    This still saves the original full logits; it does not fuse the LM head.
+    """
+    if sampled_token_ids.shape != logits.shape[:1]:
+        raise ValueError("sampled_token_ids must have one next-token label per logits row.")
+    ids = torch.cat((sampled_token_ids.long().unsqueeze(-1), topk_token_ids.long()), dim=-1)
+    log_probs = topk_log_probs_from_logits(logits, ids, chunk_size)
+    # Ulysses gathers sampled log-probs with NCCL, which requires contiguous input.
+    # Copy only this N-element vector, retaining the shared autograd backward.
+    return log_probs[:, 0].contiguous(), log_probs[:, 1:]
+
+
 def score_centering_weight_fn(
     rollout_is: Optional[str], rollout_is_threshold: str | float
 ) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -304,7 +335,11 @@ def score_centering_auto_correction(
 
 
 def score_centering_logits_processor(
-    student_logits: torch.Tensor, data: TensorDict, config: ActorConfig, data_format: str = "thd"
+    student_logits: torch.Tensor,
+    data: TensorDict,
+    config: ActorConfig,
+    data_format: str = "thd",
+    sampled_token_ids: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
 
@@ -314,6 +349,9 @@ def score_centering_logits_processor(
             sampler heads of shape [B, j, k].
         config: Actor configuration, used for ``policy_loss.rollout_correction``.
         data_format: "thd" or "bshd". Only "thd" is supported.
+        sampled_token_ids: Optional rank-local next-token labels (nnz/sp,). When
+            provided by the engine, compute sampled and head log-probs jointly.
+            Labels are already shifted and SP-sliced; do not shift or slice again.
 
     Returns:
         Dict with, each of shape (1, nnz/sp):
@@ -324,6 +362,8 @@ def score_centering_logits_processor(
             sc_support_aligned: Fraction indicator for verified support alignment.
             sc_sampler_tail_mass: Sampler probability mass outside the recorded head.
             sc_support_unknown: Approximate rows with near-unit head mass but no coverage proof.
+            log_probs: Full-vocabulary sampled log-probs, only when sampled_token_ids
+                is provided. Support renormalization remains in score_centering_ppo_loss.
     """
     if data_format != "thd":
         raise NotImplementedError("score centering supports the thd (remove padding) format only.")
@@ -343,13 +383,21 @@ def score_centering_logits_processor(
     weight_fn = score_centering_weight_fn(
         rollout_correction.get("rollout_is", None), rollout_correction.get("rollout_is_threshold", 2.0)
     )
-    train_head_log_probs = topk_log_probs_from_logits(student_logits.squeeze(0), topk_ids.squeeze(0))
+    outputs = {}
+    if sampled_token_ids is None:
+        train_head_log_probs = topk_log_probs_from_logits(student_logits.squeeze(0), topk_ids.squeeze(0))
+    else:
+        sampled_log_probs, train_head_log_probs = sampled_and_topk_log_probs_from_logits(
+            student_logits.squeeze(0), sampled_token_ids, topk_ids.squeeze(0)
+        )
+        outputs["log_probs"] = sampled_log_probs.unsqueeze(0)
     complete = support_complete.squeeze(0)
     correction, log_support_mass, sampler_head_mass, train_head_mass = score_centering_auto_correction(
         train_head_log_probs, topk_log_probs.squeeze(0), weight_fn, complete
     )
     tail_mass = (1 - sampler_head_mass).clamp(min=0)
     return {
+        **outputs,
         "sc_correction": correction.unsqueeze(0),
         "sc_sampler_head_mass": sampler_head_mass.unsqueeze(0),
         "sc_train_head_mass": train_head_mass.unsqueeze(0),
@@ -367,6 +415,7 @@ def score_centering_ppo_loss(
     dp_group=None,
     student_logits: torch.Tensor = None,
     data_format: str = "thd",
+    sampled_token_ids: torch.Tensor = None,
 ):
     """Actor loss function used both for the logits processor and the final policy loss.
     - student_logits is not None, compute the centering term in the logits processor.
@@ -379,13 +428,16 @@ def score_centering_ppo_loss(
         dp_group: Data parallel group for ``ppo_loss``.
         student_logits: (1, nnz/sp, V).
         data_format: "thd" or "bshd". Only "thd" is supported.
+        sampled_token_ids: Optional already shifted rank-local next-token labels.
 
     Returns:
         student_logits is not None: dict from ``score_centering_logits_processor``.
         student_logits is None: the (loss, metrics) tuple from ``ppo_loss``.
     """
     if student_logits is not None:
-        return score_centering_logits_processor(student_logits, data, config, data_format)
+        return score_centering_logits_processor(
+            student_logits, data, config, data_format, sampled_token_ids=sampled_token_ids
+        )
     rollout_correction = config.policy_loss.get("rollout_correction", None) or {}
     if rollout_correction.get("score_centering", False) and "sc_correction" not in model_output:
         # an entrypoint that never sets the micro-batch flag would otherwise train plain bypass PG

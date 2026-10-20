@@ -27,9 +27,8 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
 @pytest.mark.parametrize("use_remove_padding", [True, False])
 @pytest.mark.parametrize("score_centering", [True, False])
-def test_prepare_model_outputs_keeps_logits_intact_for_score_centering(use_remove_padding, score_centering):
-    """The score centering hook saves the logits and re-reads them in its backward, so the engine
-    must not run the flash-attn cross-entropy backward that writes the gradient into the logits."""
+def test_prepare_model_outputs_reuses_score_centering_log_probs(use_remove_padding, score_centering):
+    """SC supplies sampled log-probs; other paths still use their existing CE kernel."""
     seq_lengths = torch.tensor([3, 2])
     total_nnz, vocab_size = int(seq_lengths.sum()), 8
     cu_seqlens = torch.cat([torch.tensor([0]), seq_lengths.cumsum(0)])
@@ -53,12 +52,70 @@ def test_prepare_model_outputs_keeps_logits_intact_for_score_centering(use_remov
     engine = object.__new__(FSDPEngineWithLMHead)
     engine.use_ulysses_sp = False
 
-    def logits_processor(student_logits, data):
-        return {"sc_correction": torch.zeros(student_logits.shape[:2])}
+    expected = torch.arange(total_nnz, dtype=torch.float32)
+
+    def logits_processor(student_logits, data, sampled_token_ids):
+        torch.testing.assert_close(sampled_token_ids, output_args["input_ids_rmpad_rolled"])
+        return {"sc_correction": torch.zeros(student_logits.shape[:2]), "log_probs": expected.unsqueeze(0)}
 
     with patch(
         "verl.workers.engine.fsdp.transformer_impl.logprobs_from_logits", return_value=torch.zeros(total_nnz)
     ) as mock_logprobs:
-        FSDPEngineWithLMHead.prepare_model_outputs(engine, output, output_args, micro_batch, logits_processor)
+        result = FSDPEngineWithLMHead.prepare_model_outputs(engine, output, output_args, micro_batch, logits_processor)
 
-    assert mock_logprobs.call_args.kwargs.get("inplace_backward", True) is not score_centering
+    if score_centering:
+        mock_logprobs.assert_not_called()
+        torch.testing.assert_close(result["log_probs"].values(), expected)
+    else:
+        assert mock_logprobs.call_args.kwargs.get("inplace_backward", True)
+
+
+@pytest.mark.parametrize("use_remove_padding", [True, False])
+def test_joint_score_centering_engine_gradient(use_remove_padding):
+    from functools import partial
+    from types import SimpleNamespace
+
+    from verl.trainer.ppo.score_centering import score_centering_auto_correction, score_centering_logits_processor
+
+    torch.manual_seed(31)
+    offsets = torch.tensor([0, 3, 5])
+
+    def nested(values):
+        return torch.nested.nested_tensor_from_jagged(values, offsets)
+
+    ids = torch.arange(3).expand(5, -1)
+    q = torch.tensor([[0.4, 0.3, 0.2]]).expand(5, -1).log()
+    labels = torch.tensor([0, 5, 2, 7, 1])
+    micro_batch = TensorDict(
+        {"input_ids": nested(labels), "rollout_topk_ids": nested(ids), "rollout_topk_log_probs": nested(q)},
+        batch_size=[],
+    )
+    tu.assign_non_tensor(micro_batch, use_remove_padding=use_remove_padding,
+                        pad_mode=DatasetPadMode.NO_PADDING, score_centering=True)
+    shape = (1, 5, 8) if use_remove_padding else (2, 3, 8)
+    logits = torch.randn(shape, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_()
+    args = {"input_ids_rmpad_rolled": labels}
+    if use_remove_padding:
+        args.update(temperature_rmpad=torch.full((5,), 0.7), pad_size=0)
+        packed = reference.squeeze(0) / 0.7
+    else:
+        args["temperature"] = torch.full((2,), 0.7)
+        packed = torch.cat((reference[0], reference[1, :2])) / 0.7
+    engine = object.__new__(FSDPEngineWithLMHead)
+    engine.use_ulysses_sp = False
+    config = SimpleNamespace(policy_loss=SimpleNamespace(rollout_correction={}))
+    processor = partial(score_centering_logits_processor, config=config)
+    result = engine.prepare_model_outputs(SimpleNamespace(logits=logits), args, micro_batch, processor)
+    dense = packed.log_softmax(-1)
+    sampled = dense.gather(-1, labels[:, None]).squeeze(-1)
+    correction, _, _, _ = score_centering_auto_correction(
+        dense.gather(-1, ids), q, torch.ones_like, torch.zeros(5, dtype=torch.bool)
+    )
+    actual = result["sc_correction"].values() - result["log_probs"].values()
+    expected = correction - sampled
+    torch.testing.assert_close(actual, expected)
+    weights = torch.tensor([1., -0.5, 0., 0.3, 0.])
+    actual_grad = torch.autograd.grad((actual * weights).sum(), logits)[0]
+    expected_grad = torch.autograd.grad((expected * weights).sum(), reference)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=2e-6, rtol=2e-5)
